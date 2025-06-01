@@ -1,94 +1,84 @@
-import logging
-import torch
-import nltk
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
-
-# ✅ Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# ✅ Ensure NLTK punkt is available
-nltk.download("punkt")
-
-
-# ✅ Load Tokenizer and Model Globally
-logging.info("🔄 Loading fine-tuned Phi-3 model and tokenizer...")
+import os
+import json
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
 try:
-    tokenizer = AutoTokenizer.from_pretrained("fine_tuned_phi3")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/phi-3-mini-4k-instruct",
-        torch_dtype=torch.float32,  # Use float32 for CPU compatibility
-        device_map="cpu",  
-        trust_remote_code=True,
-        use_cache=False
+    from llama_cpp import Llama
+except ImportError:
+    raise ImportError(
+        "llama_cpp not found. Please install it with: "
+        "pip install llama-cpp-python"
     )
-    
-    model = PeftModel.from_pretrained(base_model, "fine_tuned_phi3").merge_and_unload()
-    
-    logging.info("✅ Model and tokenizer loaded successfully!")
 
+# Configuration
+MODEL_PATH = "./phi3-finetuned.q5_k_m.gguf"  # Download this file first
+FAISS_INDEX_PATH = "./processed_data/combined_faiss_index.faiss"
+DOC_DATA_PATH = "./processed_data/document_data.json"
+
+# Verify files exist
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Model file not found at {MODEL_PATH}. "
+        "Please download the phi-3-mini GGUF model first."
+    )
+
+# Load FAISS index and document data
+faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+with open(DOC_DATA_PATH, "r") as f:
+    document_data = json.load(f)
+
+print(f"✅ FAISS Index: {faiss_index.ntotal} vectors")
+print(f"✅ Documents: {len(document_data)} entries")
+
+# Load embedding model
+retriever = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# Initialize LLM with error handling
+try:
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_ctx=4096,
+        n_threads=4,
+        n_gpu_layers=0  # Set to >0 if you have GPU
+    )
 except Exception as e:
-    logging.error(f"❌ Error loading model/tokenizer: {e}")
-    raise SystemExit("Failed to load model or tokenizer.")
+    raise RuntimeError(f"Failed to load LLM model: {str(e)}")
 
-# ✅ Function to generate response
-def generate_response(context, user_query, max_new_tokens=50):
-    """Generate a response using the fine-tuned Phi-3 model."""
-    logging.info("🔄 Generating response using fine-tuned Phi-3...")
+def retrieve_faiss_docs(query, top_k=3):
+    query_emb = retriever.encode(query, convert_to_numpy=True).astype(np.float32).reshape(1, -1)
+    distances, indices = faiss_index.search(query_emb, top_k)
     
+    return [document_data[i]["content"] for i in indices[0] if i < len(document_data)]
+
+def format_prompt(context, query):
+    return f"""<|user|>
+You are a helpful orthopedic AI assistant. Answer the question based on the given context.
+
+Context: {context}
+
+Question: {query}
+<|assistant|>
+"""
+
+def generate_response(query):
     try:
-        # ✅ Log input details
-        logging.info(f"📥 Received query: '{user_query}'")
-        logging.info(f"📚 Context length: {len(context.split())} words")
+        docs = retrieve_faiss_docs(query)
+        if not docs:
+            return "🔍 No relevant medical information found"
         
-        # ✅ Prepare input text
-        input_text = f"Context: {context}\nQuery: {user_query}\nAnswer:"
-        logging.info("✍️ Tokenizing input...")
-
-        # ✅ Tokenize input
-        inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True).to("cpu")
-        input_ids = inputs["input_ids"][:, -64:]  # ✅ Reduce to last 64 tokens
-
-        # ✅ Log tokenized input details
-        logging.info(f"🔢 Tokenized input size: {input_ids.shape}")
-
-        # ✅ Generate response
-        logging.info("🤖 Running model inference...")
-        with torch.inference_mode():  
-            output = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=20,  
-                pad_token_id=tokenizer.eos_token_id,
-                num_beams=1,  # ✅ Faster generation
-                do_sample=True,
-                temperature=0.3,  
-                top_p=0.7,  
-                return_dict_in_generate=True,  
-                output_scores=False,  # ❌ Disabled unnecessary computation
-                use_cache=False  
-            )
-
-        # ✅ Decode response
-        response_text = tokenizer.decode(output.sequences[0], skip_special_tokens=True)
-        logging.info(f"📜 Raw generated response: {response_text}")
-
-        # ✅ Extract the final answer
-        answer_start = response_text.find("Answer:")
-        raw_answer = response_text[answer_start + len("Answer:"):].strip() if answer_start != -1 else response_text.strip()
-
-        # ✅ Format response properly
-        try:
-            sentences = nltk.sent_tokenize(raw_answer)
-            final_answer = " ".join(sentences[: min(len(sentences), 5)])
-        except Exception as e:
-            logging.error(f"❌ Error in sentence tokenization: {str(e)}")
-            final_answer = raw_answer  
-
-        logging.info(f"✅ Final extracted answer: {final_answer}")
-
-        return final_answer
-
+        context = "\n".join(docs[:3])  # Use top 3 docs
+        prompt = format_prompt(context, query)
+        
+        output = llm(
+            prompt,
+            max_tokens=512,
+            temperature=0.7,
+            top_p=0.9,
+            echo=False
+        )
+        
+        return output['choices'][0]['text'].strip()
     except Exception as e:
-        logging.error(f"❌ Error generating response: {str(e)}")
-        return "Error generating response."
+        return f"⚠️ Error: {str(e)}"
