@@ -9,7 +9,7 @@ function Assistant() {
   const [chatStarted, setChatStarted] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  const baseURL = "https://MAbdullah03-smart-med-notes.hf.space/rag";
+  const baseURL = "https://mabdullah03-smart-med-notes.hf.space/rag";
 
 
   const handleSend = async () => {
