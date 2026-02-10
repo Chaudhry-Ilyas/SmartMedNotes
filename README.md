@@ -81,6 +81,3 @@ npm install
 npm run dev
 
 
-
-## *Demo*
-https://youtu.be/lFGIggNKpR4?si=fZg-Ol4h-FSo8C7F
